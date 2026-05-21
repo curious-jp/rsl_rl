@@ -510,18 +510,24 @@ class PPO:
         return alg
 
     def broadcast_parameters(self) -> None:
-        """Broadcast model parameters to all GPUs."""
-        # Obtain the model parameters on current GPU
-        model_params = [self.actor.state_dict(), self.critic.state_dict()]
+        """Broadcast model parameters from rank 0 to all GPUs.
+
+        Each parameter/buffer tensor is broadcast in place. The previous implementation
+        used ``torch.distributed.broadcast_object_list`` on whole state_dicts, which
+        pickles CUDA tensors and was observed to silently deliver corrupted tensors to
+        some ranks (e.g. a freshly-initialized std of 1.0 arriving as garbage), causing
+        downstream "normal expects std >= 0.0" crashes. Broadcasting the live tensors
+        directly over NCCL is both correct and faster.
+        """
+        modules = [self.actor, self.critic]
         if self.rnd:
-            model_params.append(self.rnd.predictor.state_dict())
-        # Broadcast the model parameters
-        torch.distributed.broadcast_object_list(model_params, src=0)
-        # Load the model parameters on all GPUs from source GPU
-        self.actor.load_state_dict(model_params[0])
-        self.critic.load_state_dict(model_params[1])
-        if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[2])
+            modules.append(self.rnd.predictor)
+        # state_dict() returns references to the live param/buffer tensors. Iteration
+        # order is deterministic for identical modules, so every rank visits the same
+        # tensors in the same order.
+        for module in modules:
+            for tensor in module.state_dict().values():
+                torch.distributed.broadcast(tensor.data, src=0)
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.

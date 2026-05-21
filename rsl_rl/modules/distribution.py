@@ -46,6 +46,14 @@ class Distribution(nn.Module):
         """
         raise NotImplementedError
 
+    def enforce_std_bounds(self) -> None:
+        """Clamp distribution parameters back into a valid range.
+
+        Called after each optimizer step. The base implementation is a no-op; subclasses with a
+        directly-learned (non-log) std override this to guard against the std going non-positive.
+        """
+        return
+
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Extract the deterministic (mean) output from the raw MLP output.
 
@@ -166,6 +174,13 @@ class GaussianDistribution(Distribution):
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
 
+    # Lower bound for the "scalar" std parameterization. The raw std_param is used directly as the
+    # Gaussian std, so a single overly aggressive gradient step can drive it <= 0, after which
+    # Normal()/torch.normal raise "normal expects all elements of std >= 0.0". This is easy to hit
+    # on hard environments or right after resuming a checkpoint. `enforce_std_bounds()` clamps it
+    # back to this floor after each optimizer step so the parameter stays valid and can recover.
+    MIN_SCALAR_STD: float = 1e-3
+
     def update(self, mlp_output: torch.Tensor) -> None:
         """Update the Gaussian distribution from MLP output."""
         mean = mlp_output
@@ -174,6 +189,17 @@ class GaussianDistribution(Distribution):
         elif self.std_type == "log":
             std = torch.exp(self.log_std_param).expand_as(mean)
         self._distribution = Normal(mean, std)
+
+    def enforce_std_bounds(self) -> None:
+        """Clamp the std parameter to a valid positive range.
+
+        Must be called outside of inference mode / autograd tracking (e.g. right after an
+        optimizer step). Only the "scalar" parameterization needs this; the "log" form is
+        positive by construction.
+        """
+        if self.std_type == "scalar":
+            with torch.no_grad():
+                self.std_param.clamp_(min=self.MIN_SCALAR_STD)
 
     def sample(self) -> torch.Tensor:
         """Sample from the Gaussian distribution."""

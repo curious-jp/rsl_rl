@@ -374,6 +374,10 @@ class PPO:
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            # Keep the action distribution's parameters valid (e.g. a scalar std driven
+            # non-positive by the step) so the next forward does not raise.
+            if self.actor.distribution is not None:
+                self.actor.distribution.enforce_std_bounds()
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()

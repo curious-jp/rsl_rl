@@ -152,8 +152,15 @@ class OnPolicyRunner:
             load_cfg (dict | None): Optional dictionary that defines what models and states to load. If None, all
                 models and states are loaded.
             strict (bool): Whether state_dict loading should be strict.
-            map_location (str | None): Device mapping for loading the model.
+            map_location (str | None): Device mapping for loading the model. If ``None``, the checkpoint is
+                loaded directly onto this runner's device. This matters for multi-GPU training: without it,
+                every rank would load the checkpoint onto the device it was saved on (typically ``cuda:0``,
+                since only rank 0 writes checkpoints), placing 4x the checkpoint on a single GPU and leaving
+                non-zero ranks' optimizer/model state on the wrong device.
         """
+        # Default to this runner's device so each distributed rank loads onto its own GPU.
+        if map_location is None:
+            map_location = self.device
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:

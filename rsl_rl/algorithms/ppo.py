@@ -371,16 +371,24 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-            self.optimizer.step()
-            # Keep the action distribution's parameters valid (e.g. a scalar std driven
-            # non-positive by the step) so the next forward does not raise.
-            if self.actor.distribution is not None:
-                self.actor.distribution.enforce_std_bounds()
-            # Apply the gradients for RND
-            if self.rnd_optimizer:
-                self.rnd_optimizer.step()
+            actor_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            critic_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            # Skip the optimizer step if the gradients are non-finite. A single NaN/Inf
+            # gradient (e.g. from a transient bad env state) would otherwise be written
+            # into every parameter -- including the policy std -- permanently poisoning
+            # the model (NaN std crashes the next forward with "normal expects std >= 0").
+            # In multi-GPU runs reduce_parameters() all-reduces the gradients first, so
+            # every rank sees the same norms and makes the same skip decision, staying in
+            # sync.
+            if torch.isfinite(actor_norm) and torch.isfinite(critic_norm):
+                self.optimizer.step()
+                # Keep the action distribution's parameters valid (e.g. a scalar std
+                # driven non-positive by the step) so the next forward does not raise.
+                if self.actor.distribution is not None:
+                    self.actor.distribution.enforce_std_bounds()
+                # Apply the gradients for RND
+                if self.rnd_optimizer:
+                    self.rnd_optimizer.step()
 
             # Store the losses
             mean_value_loss += value_loss.item()

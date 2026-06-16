@@ -271,23 +271,33 @@ class PPO:
                     kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
                     kl_mean = torch.mean(kl)
 
-                    # Reduce the KL divergence across all GPUs
+                    kl_mean_value = float(kl_mean.detach().cpu().item())
+
+                    # Reduce the KL divergence across all GPUs without NCCL. On this
+                    # stack, NCCL collectives can hang after MuJoCo/Warp rollout.
                     if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
+                        kl_mean_tensor = torch.tensor(kl_mean_value, dtype=torch.float32)
+                        torch.distributed.all_reduce(
+                            kl_mean_tensor,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=self._cpu_collective_group(),
+                        )
+                        kl_mean_value = float((kl_mean_tensor / self.gpu_world_size).item())
 
                     # Update the learning rate only on the main process
                     if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
+                        if kl_mean_value > self.desired_kl * 2.0:
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                        elif kl_mean_value < self.desired_kl / 2.0 and kl_mean_value > 0.0:
                             self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
                     # Update the learning rate for all GPUs
                     if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
+                        lr_tensor = torch.tensor(self.learning_rate, dtype=torch.float64)
+                        torch.distributed.broadcast(
+                            lr_tensor, src=0, group=self._cpu_collective_group()
+                        )
+                        self.learning_rate = float(lr_tensor.item())
 
                     # Update the learning rate for all parameter groups
                     for param_group in self.optimizer.param_groups:
@@ -517,25 +527,46 @@ class PPO:
 
         return alg
 
+    def _cpu_collective_group(self):
+        """Return a Gloo group for small CPU collectives."""
+        if not hasattr(self, "_cpu_process_group"):
+            self._cpu_process_group = torch.distributed.new_group(backend="gloo")
+        return self._cpu_process_group
+
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters from rank 0 to all GPUs.
 
-        Each parameter/buffer tensor is broadcast in place. The previous implementation
-        used ``torch.distributed.broadcast_object_list`` on whole state_dicts, which
-        pickles CUDA tensors and was observed to silently deliver corrupted tensors to
-        some ranks (e.g. a freshly-initialized std of 1.0 arriving as garbage), causing
-        downstream "normal expects std >= 0.0" crashes. Broadcasting the live tensors
-        directly over NCCL is both correct and faster.
+        CUDA tensors inside pickled state_dicts have produced corrupted values on
+        some ranks, while tensor-by-tensor NCCL broadcasts can leave collectives
+        outstanding as rollout starts. Broadcast CPU-cloned state_dicts instead,
+        then load them into the live modules on each rank.
         """
+
         modules = [self.actor, self.critic]
         if self.rnd:
             modules.append(self.rnd.predictor)
-        # state_dict() returns references to the live param/buffer tensors. Iteration
-        # order is deterministic for identical modules, so every rank visits the same
-        # tensors in the same order.
-        for module in modules:
-            for tensor in module.state_dict().values():
-                torch.distributed.broadcast(tensor.data, src=0)
+
+        if self.gpu_global_rank == 0:
+            state_dicts = [
+                {
+                    name: tensor.detach().cpu().clone()
+                    for name, tensor in module.state_dict().items()
+                }
+                for module in modules
+            ]
+        else:
+            state_dicts = None
+
+        payload = [state_dicts]
+        torch.distributed.broadcast_object_list(
+            payload, src=0, group=self._cpu_collective_group()
+        )
+        synced_state_dicts = payload[0]
+        if synced_state_dicts is None:
+            raise RuntimeError("Failed to receive synchronized model parameters.")
+
+        for module, state_dict in zip(modules, synced_state_dicts, strict=True):
+            module.load_state_dict(state_dict)
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -547,17 +578,28 @@ class PPO:
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
         all_params = list(all_params)
-        grads = [param.grad.view(-1) for param in all_params if param.grad is not None]
+        grads = [
+            param.grad.detach().cpu().reshape(-1)
+            for param in all_params
+            if param.grad is not None
+        ]
+        if not grads:
+            return
         all_grads = torch.cat(grads)
-        # Average the gradients across all GPUs
-        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        # Average gradients across GPUs using CPU/Gloo to avoid NCCL hangs.
+        torch.distributed.all_reduce(
+            all_grads, op=torch.distributed.ReduceOp.SUM, group=self._cpu_collective_group()
+        )
         all_grads /= self.gpu_world_size
         # Update the gradients for all parameters with the reduced gradients
         offset = 0
         for param in all_params:
             if param.grad is not None:
                 numel = param.numel()
+                reduced_grad = all_grads[offset : offset + numel].view_as(param.grad.data)
                 # Copy data back from shared buffer
-                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                param.grad.data.copy_(
+                    reduced_grad.to(device=param.grad.device, dtype=param.grad.dtype)
+                )
                 # Update the offset for the next parameter
                 offset += numel
